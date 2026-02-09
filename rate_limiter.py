@@ -1,3 +1,9 @@
+"""
+Rate limiting module for API call management.
+
+This module provides a thread-safe rate limiter using a sliding window
+approach to prevent exceeding API rate limits.
+"""
 import threading
 import time
 
@@ -5,15 +11,15 @@ import time
 class RateLimiter:
     """
     Thread-safe rate limiter that tracks API calls and enforces limits.
-    
+
     Uses a sliding window approach where calls automatically expire after
     the specified period, rather than resetting all at once.
     """
-    
+
     def __init__(self, max_calls, period):
         """
         Initialize rate limiter.
-        
+
         Args:
             max_calls: Maximum number of calls allowed in the period
             period: Time period in seconds
@@ -44,22 +50,22 @@ class RateLimiter:
     def wait(self, timeout=None):
         """
         Wait until a call slot is available.
-        
+
         Args:
             timeout: Maximum time to wait in seconds (None = wait forever)
-        
+
         Returns:
             bool: True if slot became available, False if timed out
         """
         start_time = time.time()
-        
+
         while True:
             with self.lock:
                 self._clean_old_calls()
-                
+
                 if len(self.calls) < self.max_calls:
                     return True
-                
+
                 # Calculate how long until the oldest call expires
                 if self.calls:
                     oldest_call = min(self.calls)
@@ -67,13 +73,13 @@ class RateLimiter:
                     sleep_time = max(0.1, min(1.0, time_until_expire))
                 else:
                     sleep_time = 0.1
-            
+
             # Check timeout
             if timeout is not None:
                 elapsed = time.time() - start_time
                 if elapsed >= timeout:
                     return False
-            
+
             time.sleep(sleep_time)
 
     def reset(self):
@@ -84,7 +90,7 @@ class RateLimiter:
     def get_status(self):
         """
         Get current rate limiter status.
-        
+
         Returns:
             dict: Status information including current calls and remaining slots
         """
