@@ -23,6 +23,12 @@ IMAGE_FORMAT = "JPEG"
 rate_limiter = RateLimiter(max_calls=10, period=60)
 
 
+# Custom exception for critical errors that should stop batch processing
+class CriticalBatchError(Exception):
+    """Exception raised when batch processing should stop immediately."""
+    pass
+
+
 def log_error(error, error_type="GENERAL", include_traceback=True):
     """
     Log errors with appropriate detail level.
@@ -85,8 +91,14 @@ def sanitize_api_key(api_key):
     return cleaned
 
 
-def generate_description(api_key, image, prompt, detail, max_tokens, model="gpt-4o-mini"):
-    """Generate image description using OpenAI's vision API."""
+def generate_description(api_key, image, prompt, detail, max_tokens, model="gpt-4o-mini", batch_mode=False):
+    """
+    Generate image description using OpenAI's vision API.
+    
+    Args:
+        batch_mode: If True, raises CriticalBatchError for rate limit/connection errors
+                   If False, returns error strings (for single image mode)
+    """
     
     # Sanitize inputs to prevent Unicode encoding errors
     api_key = sanitize_api_key(api_key)
@@ -127,16 +139,30 @@ def generate_description(api_key, image, prompt, detail, max_tokens, model="gpt-
     except RateLimitError as e:
         # Common error - log concisely without traceback
         log_error(e, "RATE_LIMIT", include_traceback=False)
+        
+        # In batch mode, this is critical - stop processing
+        if batch_mode:
+            raise CriticalBatchError(f"Rate limit exceeded (429). Stopping batch processing to prevent further failures.")
         return f"Error: Rate limit exceeded. Please wait and try again."
     
     except APIConnectionError as e:
         # Network error - log concisely
         log_error(e, "CONNECTION", include_traceback=False)
+        
+        # In batch mode, connection errors are also critical
+        if batch_mode:
+            raise CriticalBatchError(f"Connection failed. Check your internet connection and try again.")
         return f"Error: Connection failed. Check your internet connection."
     
     except APIError as e:
         # API error - log with some detail but no full traceback
         log_error(e, "API_ERROR", include_traceback=False)
+        
+        # Check if this is an authentication error (also critical in batch mode)
+        if "authentication" in str(e).lower() or "api key" in str(e).lower():
+            if batch_mode:
+                raise CriticalBatchError(f"API authentication failed. Check your API key.")
+        
         return f"Error: API error - {str(e)}"
     
     except Exception as e:
@@ -204,19 +230,31 @@ def get_folder_path(folder_path=''):
 class ProcessingControl:
     def __init__(self):
         self.is_processing = False
+        self.should_stop = False  # Flag for critical errors
         self.lock = Lock()
     
     def start(self):
         with self.lock:
             self.is_processing = True
+            self.should_stop = False
     
     def stop(self):
         with self.lock:
             self.is_processing = False
     
+    def request_stop(self):
+        """Request stop due to critical error."""
+        with self.lock:
+            self.should_stop = True
+    
     def is_active(self):
         with self.lock:
-            return self.is_processing
+            return self.is_processing and not self.should_stop
+    
+    def was_stopped(self):
+        """Check if processing was stopped due to critical error."""
+        with self.lock:
+            return self.should_stop
 
 
 processing_control = ProcessingControl()
@@ -242,13 +280,15 @@ def process_folder(api_key, folder_path, prompt, detail, max_tokens, model, pre_
     processed_count = 0
     skipped_count = 0
     error_count = 0
+    critical_error_msg = None
 
     def process_file(file):
         """Process a single image file."""
-        nonlocal processed_count, skipped_count, error_count
+        nonlocal processed_count, skipped_count, error_count, critical_error_msg
         
+        # Check if we should stop due to critical error
         if not processing_control.is_active():
-            return "canceled"
+            return "stopped"
 
         image_path = os.path.join(folder_path, file)
         txt_path = os.path.join(folder_path, os.path.splitext(file)[0] + ".txt")
@@ -259,15 +299,8 @@ def process_folder(api_key, folder_path, prompt, detail, max_tokens, model, pre_
             return "skipped"
 
         try:
-            description = generate_description(api_key, image_path, prompt, detail, max_tokens, model)
-            
-            # Check if description is an error
-            if description.startswith("Error:"):
-                error_count += 1
-                # Log which file failed
-                with open("error_log.txt", 'a', encoding='utf-8') as log_file:
-                    log_file.write(f"Failed to process: {file} - {description}\n")
-                return "error"
+            # batch_mode=True will raise CriticalBatchError for rate limits
+            description = generate_description(api_key, image_path, prompt, detail, max_tokens, model, batch_mode=True)
             
             # Format final caption with pre/post prompts
             final_caption = format_caption(pre_prompt, description, post_prompt)
@@ -278,27 +311,57 @@ def process_folder(api_key, folder_path, prompt, detail, max_tokens, model, pre_
             
             processed_count += 1
             return "success"
+        
+        except CriticalBatchError as e:
+            # Critical error - stop all processing immediately
+            critical_error_msg = str(e)
+            processing_control.request_stop()
+            log_error(e, "CRITICAL_BATCH_ERROR", include_traceback=False)
+            
+            # Log which file triggered the stop
+            with open("error_log.txt", 'a', encoding='utf-8') as log_file:
+                log_file.write(f"Critical error on file: {file}\n")
+            
+            return "critical_error"
             
         except Exception as e:
             error_count += 1
             log_error(e, f"BATCH_PROCESSING ({file})", include_traceback=True)
+            
+            # Log which file failed
+            with open("error_log.txt", 'a', encoding='utf-8') as log_file:
+                log_file.write(f"Failed to process: {file} - {str(e)}\n")
+            
             return "error"
 
     # Process files with thread pool
     with ThreadPoolExecutor(max_workers=num_workers) as executor:
         for i, result in enumerate(executor.map(process_file, file_list), 1):
             progress((i, len(file_list)), desc=f"Processing: {i}/{len(file_list)}")
+            
+            # Stop processing if critical error occurred
             if not processing_control.is_active():
                 break
 
     processing_control.stop()
     
     # Generate results summary
-    summary = f"Batch processing complete:\n"
-    summary += f"- Total files: {len(file_list)}\n"
-    summary += f"- Processed: {processed_count}\n"
-    summary += f"- Skipped (already exist): {skipped_count}\n"
-    summary += f"- Errors: {error_count}"
+    if critical_error_msg:
+        summary = f"❌ BATCH PROCESSING STOPPED - CRITICAL ERROR\n\n"
+        summary += f"{critical_error_msg}\n\n"
+        summary += f"Results before stopping:\n"
+        summary += f"- Total files: {len(file_list)}\n"
+        summary += f"- Processed successfully: {processed_count}\n"
+        summary += f"- Skipped (already exist): {skipped_count}\n"
+        summary += f"- Errors: {error_count}\n"
+        summary += f"- Remaining: {len(file_list) - processed_count - skipped_count - error_count}\n\n"
+        summary += f"Please resolve the issue before retrying batch processing."
+    else:
+        summary = f"✓ Batch processing complete:\n"
+        summary += f"- Total files: {len(file_list)}\n"
+        summary += f"- Processed: {processed_count}\n"
+        summary += f"- Skipped (already exist): {skipped_count}\n"
+        summary += f"- Errors: {error_count}"
     
     if error_count > 0:
         summary += f"\n\nCheck error_log.txt for details on failed files."
@@ -376,6 +439,7 @@ with gr.Blocks(title="GPT-4 Vision Image Captioner") as app:
 
     with gr.Tab("Batch Processing"):
         gr.Markdown("Process all images in a folder. Creates .txt files with captions next to each image.")
+        gr.Markdown("⚠️ **Note:** Processing will automatically stop if rate limits or connection errors occur.")
         
         with gr.Row():
             folder_path_dataset = gr.Textbox(
@@ -458,7 +522,8 @@ with gr.Blocks(title="GPT-4 Vision Image Captioner") as app:
         if image is None:
             raise gr.Error("Please upload an image")
         
-        description = generate_description(api_key, image, prompt, detail, max_tokens, model)
+        # batch_mode=False for single image mode (returns error strings)
+        description = generate_description(api_key, image, prompt, detail, max_tokens, model, batch_mode=False)
         new_history = update_history(prompt, description)
         return description, new_history
 
