@@ -11,7 +11,7 @@ from threading import Lock
 import gradio as gr
 import numpy as np
 from PIL import Image
-from openai import OpenAI
+from openai import OpenAI, APIError, RateLimitError, APIConnectionError
 
 from rate_limiter import RateLimiter
 
@@ -23,9 +23,78 @@ IMAGE_FORMAT = "JPEG"
 rate_limiter = RateLimiter(max_calls=10, period=60)
 
 
-def generate_description(api_key, image, prompt, detail, max_tokens):
+def log_error(error, error_type="GENERAL", include_traceback=True):
+    """
+    Log errors with appropriate detail level.
+    
+    Args:
+        error: The exception object
+        error_type: Type of error for categorization
+        include_traceback: Whether to include full traceback
+    """
+    timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    
+    with open("error_log.txt", 'a', encoding='utf-8') as log_file:
+        log_file.write(f"\n{'='*50}\n")
+        log_file.write(f"[{timestamp}] {error_type}: {str(error)}\n")
+        
+        if include_traceback:
+            log_file.write(traceback.format_exc())
+
+
+def sanitize_text(text):
+    """
+    Remove non-ASCII characters and normalize whitespace.
+    
+    Args:
+        text: Input text string
+    
+    Returns:
+        Cleaned ASCII-safe string
+    """
+    if not text:
+        return text
+    
+    # Replace non-breaking spaces and other unicode spaces with regular spaces
+    text = text.replace('\xa0', ' ').replace('\u2009', ' ').replace('\u200b', '')
+    
+    # Normalize to ASCII (keep only ASCII characters)
+    # For prompts, we want to keep unicode, so we'll encode/decode carefully
+    return text.strip()
+
+
+def sanitize_api_key(api_key):
+    """
+    Clean API key by removing non-ASCII characters and extra whitespace.
+    
+    Args:
+        api_key: The API key string
+    
+    Returns:
+        Cleaned ASCII-only API key
+    """
+    if not api_key:
+        return api_key
+    
+    # Remove any non-ASCII characters (API keys should be ASCII only)
+    cleaned = ''.join(char for char in api_key if ord(char) < 128)
+    
+    # Remove all whitespace
+    cleaned = ''.join(cleaned.split())
+    
+    return cleaned
+
+
+def generate_description(api_key, image, prompt, detail, max_tokens, model="gpt-4o-mini"):
     """Generate image description using OpenAI's vision API."""
-    rate_limiter.wait()  # Wait if we've hit the rate limit
+    
+    # Sanitize inputs to prevent Unicode encoding errors
+    api_key = sanitize_api_key(api_key)
+    prompt = sanitize_text(prompt)
+    
+    # Reserve rate limit slot BEFORE making the call
+    rate_limiter.wait()
+    rate_limiter.add_call()
     
     try:
         # Load and process image
@@ -37,10 +106,10 @@ def generate_description(api_key, image, prompt, detail, max_tokens):
         img.save(buffered, format=IMAGE_FORMAT)
         img_base64 = base64.b64encode(buffered.getvalue()).decode()
 
-        # Make API call with updated model
+        # Make API call
         client = OpenAI(api_key=api_key)
         payload = {
-            "model": "gpt-4o",  # Updated to current model
+            "model": model,
             "messages": [{
                 "role": "user",
                 "content": [
@@ -53,18 +122,26 @@ def generate_description(api_key, image, prompt, detail, max_tokens):
         }
 
         response = client.chat.completions.create(**payload)
-        rate_limiter.add_call()  # Increment counter after successful call
-
         return response.choices[0].message.content
 
+    except RateLimitError as e:
+        # Common error - log concisely without traceback
+        log_error(e, "RATE_LIMIT", include_traceback=False)
+        return f"Error: Rate limit exceeded. Please wait and try again."
+    
+    except APIConnectionError as e:
+        # Network error - log concisely
+        log_error(e, "CONNECTION", include_traceback=False)
+        return f"Error: Connection failed. Check your internet connection."
+    
+    except APIError as e:
+        # API error - log with some detail but no full traceback
+        log_error(e, "API_ERROR", include_traceback=False)
+        return f"Error: API error - {str(e)}"
+    
     except Exception as e:
-        # Log error with timestamp
-        timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        with open("error_log.txt", 'a', encoding='utf-8') as log_file:
-            log_file.write(f"\n{'='*50}\n")
-            log_file.write(f"Timestamp: {timestamp}\n")
-            log_file.write(f"Error: {str(e)}\n")
-            log_file.write(traceback.format_exc())
+        # Unexpected error - log everything for debugging
+        log_error(e, "UNEXPECTED", include_traceback=True)
         return f"Error: {str(e)}"
 
 
@@ -145,8 +222,8 @@ class ProcessingControl:
 processing_control = ProcessingControl()
 
 
-def process_folder(api_key, folder_path, prompt, detail, max_tokens, pre_prompt="", post_prompt="",
-                   progress=gr.Progress(), num_workers=4):
+def process_folder(api_key, folder_path, prompt, detail, max_tokens, model, pre_prompt="", post_prompt="",
+                   progress=gr.Progress(), num_workers=2):
     """Process all images in a folder with batch captioning."""
     processing_control.start()
 
@@ -182,11 +259,14 @@ def process_folder(api_key, folder_path, prompt, detail, max_tokens, pre_prompt=
             return "skipped"
 
         try:
-            description = generate_description(api_key, image_path, prompt, detail, max_tokens)
+            description = generate_description(api_key, image_path, prompt, detail, max_tokens, model)
             
             # Check if description is an error
             if description.startswith("Error:"):
                 error_count += 1
+                # Log which file failed
+                with open("error_log.txt", 'a', encoding='utf-8') as log_file:
+                    log_file.write(f"Failed to process: {file} - {description}\n")
                 return "error"
             
             # Format final caption with pre/post prompts
@@ -201,7 +281,7 @@ def process_folder(api_key, folder_path, prompt, detail, max_tokens, pre_prompt=
             
         except Exception as e:
             error_count += 1
-            print(f"Error processing {file}: {str(e)}")
+            log_error(e, f"BATCH_PROCESSING ({file})", include_traceback=True)
             return "error"
 
     # Process files with thread pool
@@ -219,6 +299,9 @@ def process_folder(api_key, folder_path, prompt, detail, max_tokens, pre_prompt=
     summary += f"- Processed: {processed_count}\n"
     summary += f"- Skipped (already exist): {skipped_count}\n"
     summary += f"- Errors: {error_count}"
+    
+    if error_count > 0:
+        summary += f"\n\nCheck error_log.txt for details on failed files."
     
     return summary
 
@@ -243,12 +326,21 @@ with gr.Blocks(title="GPT-4 Vision Image Captioner") as app:
     gr.Markdown("# GPT-4 Vision Image Captioner")
     gr.Markdown("Generate captions for single images or batch process entire folders.")
     
-    api_key_input = gr.Textbox(
-        label="OpenAI API Key", 
-        placeholder="sk-...", 
-        type="password",
-        info="Your OpenAI API key. Rate limited to prevent quota exhaustion."
-    )
+    with gr.Row():
+        api_key_input = gr.Textbox(
+            scale=3,
+            label="OpenAI API Key", 
+            placeholder="sk-...", 
+            type="password",
+            info="Your OpenAI API key. Rate limited to prevent quota exhaustion."
+        )
+        model_selector = gr.Dropdown(
+            scale=1,
+            choices=["gpt-4o-mini", "gpt-4o", "gpt-4-turbo"],
+            value="gpt-4o-mini",
+            label="Model",
+            info="gpt-4o-mini: best value, gpt-4o: highest quality"
+        )
     
     with gr.Tab("Single Image"):
         image_input = gr.Image(label="Upload Image")
@@ -339,7 +431,7 @@ with gr.Blocks(title="GPT-4 Vision Image Captioner") as app:
                 value=2, 
                 step=1, 
                 label="Concurrent Workers",
-                info="More workers = faster, but may hit rate limits"
+                info="More workers = faster, but may hit rate limits. Recommended: 2-3"
             )
         
         with gr.Row():
@@ -354,28 +446,36 @@ with gr.Blocks(title="GPT-4 Vision Image Captioner") as app:
         processing_control.stop()
         return "⚠️ Processing canceled by user"
 
-    def on_single_image_submit(api_key, image, prompt, detail, max_tokens):
+    def on_single_image_submit(api_key, model, image, prompt, detail, max_tokens):
         """Handle single image caption generation."""
         if not api_key.strip():
             raise gr.Error("Please enter your OpenAI API key")
         
+        # Check for common API key issues
+        if '\xa0' in api_key or any(ord(c) >= 128 for c in api_key):
+            raise gr.Error("API key contains invalid characters. Please re-copy your API key (avoid copying from PDFs or formatted documents).")
+        
         if image is None:
             raise gr.Error("Please upload an image")
         
-        description = generate_description(api_key, image, prompt, detail, max_tokens)
+        description = generate_description(api_key, image, prompt, detail, max_tokens, model)
         new_history = update_history(prompt, description)
         return description, new_history
 
-    def on_batch_submit(api_key, folder_path, prompt, detail, max_tokens, pre_prompt, post_prompt, num_workers):
+    def on_batch_submit(api_key, model, folder_path, prompt, detail, max_tokens, pre_prompt, post_prompt, num_workers):
         """Handle batch folder processing."""
         if not api_key.strip():
             raise gr.Error("Please enter your OpenAI API key")
+        
+        # Check for common API key issues
+        if '\xa0' in api_key or any(ord(c) >= 128 for c in api_key):
+            raise gr.Error("API key contains invalid characters. Please re-copy your API key (avoid copying from PDFs or formatted documents).")
         
         if not folder_path.strip():
             raise gr.Error("Please enter a folder path")
         
         result = process_folder(
-            api_key, folder_path, prompt, detail, max_tokens, 
+            api_key, folder_path, prompt, detail, max_tokens, model,
             pre_prompt, post_prompt, num_workers=int(num_workers)
         )
         return result
@@ -387,7 +487,7 @@ with gr.Blocks(title="GPT-4 Vision Image Captioner") as app:
     
     submit_button.click(
         on_single_image_submit,
-        inputs=[api_key_input, image_input, prompt_input, detail_level, max_tokens_input],
+        inputs=[api_key_input, model_selector, image_input, prompt_input, detail_level, max_tokens_input],
         outputs=[output, history_table]
     )
     
@@ -397,6 +497,7 @@ with gr.Blocks(title="GPT-4 Vision Image Captioner") as app:
         on_batch_submit,
         inputs=[
             api_key_input,
+            model_selector,
             folder_path_dataset,
             prompt_input_dataset,
             detail_level_dataset,
