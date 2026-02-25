@@ -538,10 +538,10 @@ with gr.Blocks(title="GPT-4 Vision Image Captioner") as app:
         )
         ollama_model_selector = gr.Dropdown(
             scale=1,
-            choices=["llava", "llava:7b", "llava:13b", "llava:34b", "llama3.2-vision", "llama3.2-vision:11b", "llama3.2-vision:90b", "minicpm-v", "bakllava"],
-            value="llava",
+            choices=["llama3.2-vision", "qwen2.5-vl", "minicpm-v", "moondream", "llava", "llava:13b", "bakllava"],
+            value="llama3.2-vision",
             label="Ollama Model",
-            info="llava: general purpose, llama3.2-vision: latest from Meta",
+            info="llama3.2-vision: best overall, qwen2.5-vl: best for OCR",
             visible=False
         )
 
