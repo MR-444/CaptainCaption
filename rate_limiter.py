@@ -82,6 +82,38 @@ class RateLimiter:
 
             time.sleep(sleep_time)
 
+    def reserve(self, timeout=None):
+        """
+        Atomically wait for a slot and record the call.
+
+        Unlike wait()+add_call(), this cannot over-subscribe under contention:
+        the slot check and the timestamp append happen inside a single
+        critical section.
+
+        Returns:
+            bool: True if a slot was reserved, False if timed out
+        """
+        start_time = time.time()
+
+        while True:
+            with self.lock:
+                self._clean_old_calls()
+
+                if len(self.calls) < self.max_calls:
+                    self.calls.append(time.time())
+                    return True
+
+                oldest_call = min(self.calls)
+                time_until_expire = self.period - (time.time() - oldest_call)
+                sleep_time = max(0.05, min(1.0, time_until_expire))
+
+            if timeout is not None:
+                elapsed = time.time() - start_time
+                if elapsed >= timeout:
+                    return False
+
+            time.sleep(sleep_time)
+
     def reset(self):
         """Manually reset all call records (use with caution)."""
         with self.lock:

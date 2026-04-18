@@ -7,6 +7,8 @@ using either OpenAI's GPT-4 Vision API (cloud) or Ollama (local).
 import base64
 import datetime
 import io
+import logging
+import logging.handlers
 import os
 import sys
 import traceback
@@ -17,13 +19,16 @@ from threading import Lock
 import gradio as gr
 import numpy as np
 from PIL import Image
-from openai import OpenAI, APIError, RateLimitError, APIConnectionError
+from openai import OpenAI, APIError, RateLimitError, APIConnectionError, AuthenticationError
 
 from rate_limiter import RateLimiter
 
 FOLDER_SYMBOL = '\U0001f4c2'  # 📂
 MAX_IMAGE_WIDTH = 2048
 IMAGE_FORMAT = "JPEG"
+DEFAULT_PROMPT = "Describe this image in detail. Focus on the main subjects, actions, setting, and mood."
+DEFAULT_MAX_TOKENS = 300
+OLLAMA_DEFAULT_TIMEOUT = 180.0
 
 # Rate limiter: 10 requests per minute (conservative for API tier limits)
 # Note: Only used for OpenAI, not for Ollama
@@ -35,23 +40,23 @@ class CriticalBatchError(Exception):
     """Exception raised when batch processing should stop immediately."""
 
 
+_error_logger = logging.getLogger("captaincaption.errors")
+_error_logger.setLevel(logging.INFO)
+_error_logger.propagate = False
+if not _error_logger.handlers:
+    _handler = logging.handlers.RotatingFileHandler(
+        "error_log.txt", maxBytes=5 * 1024 * 1024, backupCount=3, encoding="utf-8"
+    )
+    _handler.setFormatter(logging.Formatter("[%(asctime)s] %(message)s"))
+    _error_logger.addHandler(_handler)
+
+
 def log_error(error, error_type="GENERAL", include_traceback=True):
-    """
-    Log errors with appropriate detail level.
-
-    Args:
-        error: The exception object
-        error_type: Type of error for categorization
-        include_traceback: Whether to include full traceback
-    """
-    timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-
-    with open("error_log.txt", 'a', encoding='utf-8') as log_file:
-        log_file.write(f"\n{'='*50}\n")
-        log_file.write(f"[{timestamp}] {error_type}: {str(error)}\n")
-
-        if include_traceback:
-            log_file.write(traceback.format_exc())
+    """Log errors to a rotating file (5 MB × 3 backups, thread-safe)."""
+    message = f"{error_type}: {error}"
+    if include_traceback:
+        message += "\n" + traceback.format_exc()
+    _error_logger.info(message)
 
 
 def sanitize_text(text):
@@ -110,9 +115,8 @@ def generate_description_openai(api_key, image, prompt, detail, max_tokens, mode
     api_key = sanitize_api_key(api_key)
     prompt = sanitize_text(prompt)
 
-    # Reserve rate limit slot BEFORE making the call
-    rate_limiter.wait()
-    rate_limiter.add_call()
+    # Reserve rate limit slot atomically BEFORE making the call
+    rate_limiter.reserve()
 
     try:
         # Load and process image
@@ -160,14 +164,19 @@ def generate_description_openai(api_key, image, prompt, detail, max_tokens, mode
             raise CriticalBatchError(f"Connection failed. Check your internet connection and try again.")
         return f"Error: Connection failed. Check your internet connection."
 
+    except AuthenticationError as e:
+        log_error(e, "AUTH", include_traceback=False)
+        if batch_mode:
+            raise CriticalBatchError("API authentication failed. Check your API key.")
+        return "Error: API authentication failed. Check your API key."
+
     except APIError as e:
         # API error - log with some detail but no full traceback
         log_error(e, "API_ERROR", include_traceback=False)
 
-        # Check if this is an authentication error (also critical in batch mode)
-        if "authentication" in str(e).lower() or "api key" in str(e).lower():
-            if batch_mode:
-                raise CriticalBatchError(f"API authentication failed. Check your API key.")
+        # Fallback string-match for older SDK versions that don't raise AuthenticationError
+        if batch_mode and ("authentication" in str(e).lower() or "api key" in str(e).lower()):
+            raise CriticalBatchError(f"API authentication failed. Check your API key.")
 
         return f"Error: API error - {str(e)}"
 
@@ -177,7 +186,7 @@ def generate_description_openai(api_key, image, prompt, detail, max_tokens, mode
         return f"Error: {str(e)}"
 
 
-def generate_description_ollama(ollama_url, image, prompt, model="llava", batch_mode=False):
+def generate_description_ollama(ollama_url, image, prompt, model="llava", batch_mode=False, timeout=OLLAMA_DEFAULT_TIMEOUT):
     """
     Generate image description using Ollama's vision API (local).
 
@@ -187,6 +196,7 @@ def generate_description_ollama(ollama_url, image, prompt, model="llava", batch_
         prompt: Text prompt
         model: Ollama model name (llava, llama3.2-vision, etc.)
         batch_mode: If True, raises CriticalBatchError for critical errors
+        timeout: HTTP timeout in seconds for the Ollama client (covers model load + inference)
     """
     try:
         # Import ollama library
@@ -208,7 +218,7 @@ def generate_description_ollama(ollama_url, image, prompt, model="llava", batch_
         img_base64 = base64.b64encode(buffered.getvalue()).decode()
 
         # Make API call to Ollama
-        client = Client(host=ollama_url) if ollama_url else Client()
+        client = Client(host=ollama_url, timeout=timeout) if ollama_url else Client(timeout=timeout)
         response = client.chat(
             model=model,
             messages=[{
@@ -238,14 +248,14 @@ def generate_description_ollama(ollama_url, image, prompt, model="llava", batch_
         return f"Error: {error_msg}"
 
 
-def generate_description(provider, api_key, ollama_url, image, prompt, detail, max_tokens, model, batch_mode=False):
+def generate_description(provider, api_key, ollama_url, image, prompt, detail, max_tokens, model, batch_mode=False, ollama_timeout=OLLAMA_DEFAULT_TIMEOUT):
     """
     Generate image description using selected provider (OpenAI or Ollama).
     """
     if provider == "OpenAI":
         return generate_description_openai(api_key, image, prompt, detail, max_tokens, model, batch_mode)
     elif provider == "Ollama":
-        return generate_description_ollama(ollama_url, image, prompt, model, batch_mode)
+        return generate_description_ollama(ollama_url, image, prompt, model, batch_mode, timeout=ollama_timeout)
     else:
         return "Error: Unknown provider"
 
@@ -284,7 +294,12 @@ def get_dir(file_path):
 
 
 def get_folder_path(folder_path=''):
-    """Open folder selection dialog."""
+    """Open a native folder-picker dialog on the SERVER machine.
+
+    Only useful when the browser and the Gradio server run on the same
+    machine. On a remote deployment the dialog appears on the server's
+    desktop, not in the user's browser.
+    """
     current_folder_path = folder_path
     initial_dir, _ = get_dir(folder_path)
 
@@ -342,14 +357,14 @@ class ProcessingControl:
 
 # Dictionary to hold per-user processing controls
 user_processing_controls = {}
+_controls_lock = Lock()
 
 def get_processing_control(request: gr.Request):
     session_id = request.session_hash if request else "default"
-    if session_id not in user_processing_controls:
-        user_processing_controls[session_id] = ProcessingControl()
-    return user_processing_controls[session_id]
+    with _controls_lock:
+        return user_processing_controls.setdefault(session_id, ProcessingControl())
 
-def process_image(processing_control, provider, api_key, ollama_url, image_path, prompt, detail, max_tokens, model, pre_prompt, post_prompt):
+def process_image(processing_control, provider, api_key, ollama_url, image_path, prompt, detail, max_tokens, model, pre_prompt, post_prompt, ollama_timeout=OLLAMA_DEFAULT_TIMEOUT):
     """
     Process a single image and save its caption to a text file.
 
@@ -369,8 +384,13 @@ def process_image(processing_control, provider, api_key, ollama_url, image_path,
     try:
         # Generate description
         description = generate_description(
-            provider, api_key, ollama_url, image_path, prompt, detail, max_tokens, model, batch_mode=True
+            provider, api_key, ollama_url, image_path, prompt, detail, max_tokens, model,
+            batch_mode=True, ollama_timeout=ollama_timeout,
         )
+
+        # Treat None or "Error: ..." strings as failures; never persist them as captions
+        if description is None or (isinstance(description, str) and description.startswith("Error:")):
+            return False, "ERROR", description
 
         # Format with pre/post prompts
         caption = format_caption(pre_prompt, description, post_prompt)
@@ -391,15 +411,19 @@ def process_image(processing_control, provider, api_key, ollama_url, image_path,
         return False, "ERROR", str(e)
 
 
-def process_folder(processing_control, provider, api_key, ollama_url, folder_path, prompt, detail, max_tokens, model, pre_prompt, post_prompt, num_workers=2):
+def process_folder(processing_control, provider, api_key, ollama_url, folder_path, prompt, detail, max_tokens, model, pre_prompt, post_prompt, num_workers=2, ollama_timeout=OLLAMA_DEFAULT_TIMEOUT, progress=gr.Progress()):
     """
     Process all images in a folder using concurrent workers.
+
+    A ``progress`` callable (Gradio auto-injects ``gr.Progress()``) is used to
+    surface per-file progress in the UI. It is safe to call in non-UI contexts
+    because ``gr.Progress`` no-ops outside of a Gradio event.
     """
     # Start processing
     processing_control.start()
 
     # Get all image files
-    image_extensions = {'.png', '.jpg', '.jpeg'}
+    image_extensions = {'.png', '.jpg', '.jpeg', '.webp', '.bmp', '.tiff', '.tif'}
     file_list = [
         os.path.join(folder_path, f)
         for f in os.listdir(folder_path)
@@ -410,25 +434,35 @@ def process_folder(processing_control, provider, api_key, ollama_url, folder_pat
         processing_control.finish()
         return "No image files found in the specified folder."
 
+    total = len(file_list)
+
     # Counters
     processed_count = 0
     skipped_count = 0
     error_count = 0
     critical_error_msg = None
 
+    # Initial progress tick so the user sees the bar immediately
+    try:
+        progress(0, desc=f"Starting batch ({total} files)", total=total)
+    except Exception:
+        # progress may be a bare callable / None in tests — never let it block work
+        pass
+
     # Process images with thread pool
-    with ThreadPoolExecutor(max_workers=num_workers) as executor:
+    executor = ThreadPoolExecutor(max_workers=num_workers)
+    try:
         futures = []
         for image_path in file_list:
             future = executor.submit(
                 process_image,
                 processing_control, provider, api_key, ollama_url, image_path, prompt, detail, max_tokens, model,
-                pre_prompt, post_prompt
+                pre_prompt, post_prompt, ollama_timeout,
             )
             futures.append((future, os.path.basename(image_path)))
 
         # Collect results
-        for future, filename in futures:
+        for idx, (future, filename) in enumerate(futures, start=1):
             try:
                 success, status, description = future.result()
 
@@ -441,20 +475,33 @@ def process_folder(processing_control, provider, api_key, ollama_url, folder_pat
                 elif status == "CRITICAL":
                     critical_error_msg = description
                     print(f"✗ CRITICAL ERROR: {description}")
-                    break  # Break here ONLY after saving the actual description
+                    # Cancel any pending futures so outstanding workers don't keep firing
+                    for pending, _ in futures:
+                        pending.cancel()
+                    break
                 elif status == "ERROR":
                     error_count += 1
                     print(f"✗ Error: {filename} - {description}")
                 elif status == "STOPPED":
                     break
 
+                # Update UI progress bar after each file
+                try:
+                    progress(
+                        idx / total,
+                        desc=f"{idx}/{total} — {filename}",
+                        total=total,
+                    )
+                except Exception:
+                    pass
+
             except Exception as e:
                 error_count += 1
                 log_error(e, f"FUTURE_ERROR_{filename}")
                 print(f"✗ Future error: {filename}")
-
-    # Finish processing
-    processing_control.finish()
+    finally:
+        executor.shutdown(wait=True, cancel_futures=True)
+        processing_control.finish()
 
     # Generate results summary
     if critical_error_msg:
@@ -480,29 +527,148 @@ def process_folder(processing_control, provider, api_key, ollama_url, folder_pat
     return summary
 
 
+_VISION_NAME_HINTS = (
+    "llava", "bakllava", "moondream", "vision", "-vl", "minicpm-v",
+    "gemma3", "pixtral", "internvl", "qwen2-vl", "qwen2.5-vl",
+)
+
+
+def list_ollama_models(url, timeout=3.0):
+    """Fetch available model tags from an Ollama instance via /api/tags.
+
+    Returns a sorted list of model names, or [] if the instance is
+    unreachable / times out. Uses stdlib urllib so tests can patch it.
+    """
+    import json
+    import urllib.request
+
+    base = (url or "http://localhost:11434").rstrip("/")
+    try:
+        with urllib.request.urlopen(f"{base}/api/tags", timeout=timeout) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+    except Exception:
+        return []
+
+    names = set()
+    for entry in data.get("models", []) or []:
+        name = entry.get("model") or entry.get("name")
+        if name:
+            names.add(name)
+    return sorted(names)
+
+
+def list_running_ollama_models(url, timeout=3.0):
+    """Return the set of model names currently loaded in Ollama (/api/ps)."""
+    import json
+    import urllib.request
+
+    base = (url or "http://localhost:11434").rstrip("/")
+    try:
+        with urllib.request.urlopen(f"{base}/api/ps", timeout=timeout) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+    except Exception:
+        return set()
+
+    loaded = set()
+    for entry in data.get("models", []) or []:
+        name = entry.get("model") or entry.get("name")
+        if name:
+            loaded.add(name)
+    return loaded
+
+
+def get_ollama_model_capabilities(url, model_name, timeout=3.0):
+    """Return the Ollama /api/show capabilities list, or None if unavailable.
+
+    Newer Ollama (>=0.4) returns a ``capabilities`` array like
+    ``["completion", "vision"]``. Older versions return no such field —
+    we return None so callers can fall back to a name heuristic.
+    """
+    import json
+    import urllib.request
+
+    base = (url or "http://localhost:11434").rstrip("/")
+    req = urllib.request.Request(
+        f"{base}/api/show",
+        data=json.dumps({"name": model_name}).encode("utf-8"),
+        headers={"Content-Type": "application/json"},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+    except Exception:
+        return None
+    return data.get("capabilities")
+
+
+def list_ollama_vision_models(url, timeout=3.0):
+    """Return vision-capable Ollama models installed at ``url``.
+
+    Strategy: query /api/tags, then /api/show in parallel. If Ollama
+    returns capabilities, filter by "vision". If capabilities aren't
+    exposed (older Ollama), fall back to a name-keyword heuristic.
+
+    Returns ``(vision_models, other_models)``.
+    """
+    names = list_ollama_models(url, timeout=timeout)
+    if not names:
+        return [], []
+
+    workers = min(8, len(names))
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        caps_list = list(pool.map(
+            lambda n: get_ollama_model_capabilities(url, n, timeout),
+            names,
+        ))
+
+    vision, other, unknown = [], [], []
+    for name, caps in zip(names, caps_list):
+        if caps is None:
+            unknown.append(name)
+        elif "vision" in caps:
+            vision.append(name)
+        else:
+            other.append(name)
+
+    # If /api/show never returned capabilities, fall back to name heuristic
+    if unknown and not vision and not other:
+        for name in unknown:
+            lower = name.lower()
+            if any(hint in lower for hint in _VISION_NAME_HINTS):
+                vision.append(name)
+            else:
+                other.append(name)
+        return vision, other
+
+    # Mixed case: trust the API verdict, bucket unknowns as "other"
+    return vision, other + unknown
+
+
 def format_caption(pre_prompt, description, post_prompt):
     """Format caption with optional pre/post prompts."""
     parts = []
 
-    if pre_prompt.strip():
+    if pre_prompt and pre_prompt.strip():
         parts.append(pre_prompt.strip())
 
-    parts.append(description.strip())
+    if description and description.strip():
+        parts.append(description.strip())
 
-    if post_prompt.strip():
+    if post_prompt and post_prompt.strip():
         parts.append(post_prompt.strip())
 
     return ", ".join(parts)
 
 
 # Gradio UI
-with gr.Blocks(title="GPT-4 Vision Image Captioner") as app:
-    gr.Markdown("# 🖼️ Image Captioner (OpenAI + Ollama)")
-    gr.Markdown("Generate captions for single images or batch process entire folders using OpenAI or local Ollama models.")
+with gr.Blocks(title="Image Captioner") as app:
+    gr.Markdown("# 🖼️ Image Captioner")
+    gr.Markdown("Generate captions for single images or batch-process entire folders using OpenAI or local Ollama models.")
 
     history_state = gr.State(lambda: [])
 
-    with gr.Row():
+    # Provider / credentials / model — grouped so it reads as one logical form
+    with gr.Group():
         provider_selector = gr.Radio(
             ["OpenAI", "Ollama"],
             value="OpenAI",
@@ -510,64 +676,122 @@ with gr.Blocks(title="GPT-4 Vision Image Captioner") as app:
             info="Choose between cloud (OpenAI) or local (Ollama)"
         )
 
-    with gr.Row():
-        api_key_input = gr.Textbox(
-            scale=2,
-            label="OpenAI API Key",
-            placeholder="sk-...",
-            type="password",
-            info="Required for OpenAI only",
-            visible=True
+        with gr.Row(equal_height=True):
+            api_key_input = gr.Textbox(
+                scale=2,
+                label="OpenAI API Key",
+                placeholder="sk-...",
+                type="password",
+                info="Required for OpenAI only",
+                visible=True
+            )
+            ollama_url_input = gr.Textbox(
+                scale=2,
+                label="Ollama URL",
+                value="http://localhost:11434",
+                info="URL where Ollama is running",
+                visible=False
+            )
+            openai_model_selector = gr.Dropdown(
+                scale=2,
+                choices=["gpt-4o-mini", "gpt-4o", "gpt-4-turbo"],
+                value="gpt-4o-mini",
+                label="OpenAI Model",
+                info="gpt-4o-mini: best value, gpt-4o: highest quality",
+                visible=True
+            )
+            ollama_model_selector = gr.Dropdown(
+                scale=2,
+                choices=[],
+                value=None,
+                label="Ollama Model",
+                info="Detected from your Ollama instance",
+                visible=False,
+                allow_custom_value=True,
+            )
+            ollama_refresh_button = gr.Button(
+                "🔄", scale=0, size="sm", visible=False,
+                variant="secondary",
+            )
+            ollama_timeout_input = gr.Number(
+                scale=1,
+                value=OLLAMA_DEFAULT_TIMEOUT,
+                label="Ollama timeout (s)",
+                info="Covers model load + inference",
+                minimum=10,
+                maximum=900,
+                visible=False,
+            )
+
+    def _decorate_model_choices(models, running):
+        """Return [(label, value), ...] with ● for loaded, ○ for installed-only."""
+        return [
+            ((f"● {m}  (loaded)" if m in running else f"○ {m}"), m)
+            for m in models
+        ]
+
+    def _ollama_model_dropdown_update(ollama_url, visible):
+        """Build a Dropdown update for the Ollama model selector."""
+        if not visible:
+            return gr.update(visible=False)
+        vision, other = list_ollama_vision_models(ollama_url)
+        running = list_running_ollama_models(ollama_url)
+        if not vision and not other:
+            return gr.update(
+                choices=[], value=None, visible=True,
+                info=f"⚠️ Could not reach Ollama at {ollama_url}. Start it, then click 🔄",
+            )
+        models = vision or other
+        note_kind = "vision-capable" if vision else "⚠️ no vision models, showing all"
+        loaded_count = sum(1 for m in models if m in running)
+        info = (
+            f"{len(models)} {note_kind} · {loaded_count} already loaded "
+            "(● = loaded, ○ = needs load)"
         )
-        ollama_url_input = gr.Textbox(
-            scale=2,
-            label="Ollama URL",
-            value="http://localhost:11434",
-            info="URL where Ollama is running",
-            visible=False
+        return gr.update(
+            choices=_decorate_model_choices(models, running),
+            value=next((m for m in models if m in running), models[0]),
+            visible=True,
+            info=info,
         )
 
-    with gr.Row():
-        openai_model_selector = gr.Dropdown(
-            scale=1,
-            choices=["gpt-4o-mini", "gpt-4o", "gpt-4-turbo"],
-            value="gpt-4o-mini",
-            label="OpenAI Model",
-            info="gpt-4o-mini: best value, gpt-4o: highest quality",
-            visible=True
-        )
-        ollama_model_selector = gr.Dropdown(
-            scale=1,
-            choices=["llama3.2-vision", "qwen2.5-vl", "minicpm-v", "moondream", "llava", "llava:13b", "bakllava"],
-            value="llama3.2-vision",
-            label="Ollama Model",
-            info="llama3.2-vision: best overall, qwen2.5-vl: best for OCR",
-            visible=False
-        )
-
-    # Update visibility based on provider selection
     def update_provider_visibility(provider):
-        """Update UI element visibility based on selected provider."""
+        """Toggle visibility only — fast, synchronous, no network I/O."""
         is_openai = provider == "OpenAI"
+        ollama_placeholder = gr.update(
+            visible=not is_openai,
+            info="Click 🔄 to load models from Ollama",
+        ) if not is_openai else gr.update(visible=False)
         return (
             gr.update(visible=is_openai),  # api_key_input
             gr.update(visible=not is_openai),  # ollama_url_input
             gr.update(visible=is_openai),  # openai_model_selector
-            gr.update(visible=not is_openai),  # ollama_model_selector
-            gr.update(visible=is_openai),  # detail_level (only for OpenAI)
-            gr.update(visible=is_openai),  # max_tokens (only for OpenAI)
+            ollama_placeholder,  # ollama_model_selector
+            gr.update(visible=not is_openai),  # ollama_refresh_button
+            gr.update(visible=not is_openai),  # ollama_timeout_input
+            gr.update(visible=is_openai),  # detail_level
+            gr.update(visible=is_openai),  # max_tokens
             gr.update(visible=is_openai),  # detail_level_dataset
             gr.update(visible=is_openai),  # max_tokens_dataset
         )
 
+    def refresh_ollama_models(ollama_url):
+        return _ollama_model_dropdown_update(ollama_url, visible=True)
+
+    def auto_refresh_on_ollama(provider, ollama_url):
+        """Chained after visibility: fetches models only when switching to Ollama."""
+        if provider != "Ollama":
+            return gr.update()
+        return _ollama_model_dropdown_update(ollama_url, visible=True)
+
     with gr.Tab("Single Image"):
-        image_input = gr.Image(label="Upload Image")
+        image_input = gr.Image(label="Upload Image", height=360)
 
         with gr.Row():
             prompt_input = gr.Textbox(
                 scale=6,
                 label="Prompt",
-                value="Describe this image in detail. Focus on the main subjects, actions, setting, and mood.",
+                value=DEFAULT_PROMPT,
                 interactive=True
             )
             detail_level = gr.Radio(
@@ -580,7 +804,7 @@ with gr.Blocks(title="GPT-4 Vision Image Captioner") as app:
             )
             max_tokens_input = gr.Number(
                 scale=1,
-                value=300,
+                value=DEFAULT_MAX_TOKENS,
                 label="Max Tokens (OpenAI only)",
                 minimum=50,
                 maximum=1000,
@@ -591,7 +815,11 @@ with gr.Blocks(title="GPT-4 Vision Image Captioner") as app:
         output = gr.Textbox(label="Generated Caption", lines=5)
 
         with gr.Accordion("History", open=False):
-            history_table = gr.Dataframe(headers=columns, interactive=False)
+            history_table = gr.Dataframe(
+                headers=columns,
+                interactive=False,
+                wrap=True,
+            )
             clear_button = gr.Button("Clear History")
 
     with gr.Tab("Batch Processing"):
@@ -612,7 +840,7 @@ with gr.Blocks(title="GPT-4 Vision Image Captioner") as app:
             prompt_input_dataset = gr.Textbox(
                 scale=6,
                 label="Prompt",
-                value="Describe this image in detail. Focus on the main subjects, actions, setting, and mood.",
+                value=DEFAULT_PROMPT,
                 interactive=True
             )
             detail_level_dataset = gr.Radio(
@@ -624,30 +852,29 @@ with gr.Blocks(title="GPT-4 Vision Image Captioner") as app:
             )
             max_tokens_input_dataset = gr.Number(
                 scale=1,
-                value=300,
+                value=DEFAULT_MAX_TOKENS,
                 label="Max Tokens (OpenAI only)",
                 minimum=50,
                 maximum=1000,
                 visible=True
             )
 
-        with gr.Row():
-            pre_prompt_input = gr.Textbox(
-                scale=1,
-                label="Prefix",
-                placeholder="e.g., 'masterpiece, high quality'",
-                info="Added at the start of each caption",
-                interactive=True
-            )
-            post_prompt_input = gr.Textbox(
-                scale=1,
-                label="Postfix",
-                placeholder="e.g., 'trending on artstation'",
-                info="Added at the end of each caption",
-                interactive=True
-            )
-
-        with gr.Row():
+        with gr.Accordion("Advanced", open=False):
+            with gr.Row():
+                pre_prompt_input = gr.Textbox(
+                    scale=1,
+                    label="Prefix",
+                    placeholder="e.g., 'masterpiece, high quality'",
+                    info="Added at the start of each caption",
+                    interactive=True
+                )
+                post_prompt_input = gr.Textbox(
+                    scale=1,
+                    label="Postfix",
+                    placeholder="e.g., 'trending on artstation'",
+                    info="Added at the end of each caption",
+                    interactive=True
+                )
             worker_slider = gr.Slider(
                 minimum=1,
                 maximum=8,
@@ -668,14 +895,12 @@ with gr.Blocks(title="GPT-4 Vision Image Captioner") as app:
         """Cancel ongoing batch processing."""
         pc = get_processing_control(request)
         pc.stop()
+        # Toast gives immediate visual confirmation; textbox keeps the status.
+        gr.Info("Cancel requested — workers will stop after the current file.")
         return "⚠️ Processing canceled by user"
 
-    def on_single_image_submit(history_list, provider, api_key, ollama_url, openai_model, ollama_model, image, prompt, detail, max_tokens):
-        """Handle single image caption generation."""
-        # Select the right model based on provider
-        model = openai_model if provider == "OpenAI" else ollama_model
-
-        # Validate inputs based on provider
+    def _validate_provider_inputs(provider, api_key, ollama_url):
+        """Shared validation for both single-image and batch flows."""
         if provider == "OpenAI":
             if not api_key.strip():
                 raise gr.Error("Please enter your OpenAI API key")
@@ -684,53 +909,69 @@ with gr.Blocks(title="GPT-4 Vision Image Captioner") as app:
         else:  # Ollama
             if not ollama_url.strip():
                 raise gr.Error("Please enter Ollama URL")
+
+    def on_single_image_submit(history_list, provider, api_key, ollama_url, openai_model, ollama_model, ollama_timeout, image, prompt, detail, max_tokens):
+        """Handle single image caption generation."""
+        model = openai_model if provider == "OpenAI" else ollama_model
+        _validate_provider_inputs(provider, api_key, ollama_url)
 
         if image is None:
             raise gr.Error("Please upload an image")
 
         # Generate description
         description = generate_description(
-            provider, api_key, ollama_url, image, prompt, detail, max_tokens, model, batch_mode=False
+            provider, api_key, ollama_url, image, prompt, detail, max_tokens, model,
+            batch_mode=False, ollama_timeout=float(ollama_timeout or OLLAMA_DEFAULT_TIMEOUT),
         )
         new_history_list, display_data = update_history(history_list, prompt, description)
         return description, display_data, new_history_list
 
-    def on_batch_submit(request: gr.Request, provider, api_key, ollama_url, openai_model, ollama_model, folder_path, prompt, detail, max_tokens, pre_prompt, post_prompt, num_workers):
-        """Handle batch folder processing."""
+    def on_batch_submit(request: gr.Request, provider, api_key, ollama_url, openai_model, ollama_model, ollama_timeout, folder_path, prompt, detail, max_tokens, pre_prompt, post_prompt, num_workers, progress=gr.Progress()):
+        """Handle batch folder processing. ``progress`` is auto-injected by Gradio."""
         pc = get_processing_control(request)
-
-        # Select the right model based on provider
         model = openai_model if provider == "OpenAI" else ollama_model
-
-        # Validate inputs based on provider
-        if provider == "OpenAI":
-            if not api_key.strip():
-                raise gr.Error("Please enter your OpenAI API key")
-            if '\xa0' in api_key or any(ord(c) >= 128 for c in api_key):
-                raise gr.Error("API key contains invalid characters. Please re-copy your API key.")
-        else:  # Ollama
-            if not ollama_url.strip():
-                raise gr.Error("Please enter Ollama URL")
+        _validate_provider_inputs(provider, api_key, ollama_url)
 
         if not folder_path.strip():
             raise gr.Error("Please enter a folder path")
+        if not os.path.isdir(folder_path):
+            raise gr.Error(f"Folder not found: {folder_path}")
 
         result = process_folder(
             pc, provider, api_key, ollama_url, folder_path, prompt, detail, max_tokens, model,
-            pre_prompt, post_prompt, num_workers=int(num_workers)
+            pre_prompt, post_prompt, num_workers=int(num_workers),
+            ollama_timeout=float(ollama_timeout or OLLAMA_DEFAULT_TIMEOUT),
+            progress=progress,
         )
         return result
 
     # Wire up events
+    # Visibility toggle is instant (queue=False). A follow-up .then() runs the
+    # network call to Ollama on the queue so it never blocks the UI.
     provider_selector.change(
         update_provider_visibility,
         inputs=[provider_selector],
         outputs=[
             api_key_input, ollama_url_input,
             openai_model_selector, ollama_model_selector,
+            ollama_refresh_button, ollama_timeout_input,
             detail_level, max_tokens_input,
             detail_level_dataset, max_tokens_input_dataset
-        ]
+        ],
+        queue=False,
+        show_progress="hidden",
+    ).then(
+        auto_refresh_on_ollama,
+        inputs=[provider_selector, ollama_url_input],
+        outputs=[ollama_model_selector],
+        show_progress="minimal",
+    )
+
+    ollama_refresh_button.click(
+        refresh_ollama_models,
+        inputs=[ollama_url_input],
+        outputs=[ollama_model_selector],
+        show_progress="minimal",
     )
 
     clear_button.click(clear_fields, inputs=[], outputs=[output, history_table, history_state])
@@ -741,7 +982,7 @@ with gr.Blocks(title="GPT-4 Vision Image Captioner") as app:
         on_single_image_submit,
         inputs=[
             history_state, provider_selector, api_key_input, ollama_url_input,
-            openai_model_selector, ollama_model_selector,
+            openai_model_selector, ollama_model_selector, ollama_timeout_input,
             image_input, prompt_input, detail_level, max_tokens_input
         ],
         outputs=[output, history_table, history_state]
@@ -753,7 +994,7 @@ with gr.Blocks(title="GPT-4 Vision Image Captioner") as app:
         on_batch_submit,
         inputs=[
             provider_selector, api_key_input, ollama_url_input,
-            openai_model_selector, ollama_model_selector,
+            openai_model_selector, ollama_model_selector, ollama_timeout_input,
             folder_path_dataset,
             prompt_input_dataset,
             detail_level_dataset,
@@ -767,4 +1008,4 @@ with gr.Blocks(title="GPT-4 Vision Image Captioner") as app:
 
 
 if __name__ == "__main__":
-    app.launch()
+    app.launch(theme=gr.themes.Soft())
