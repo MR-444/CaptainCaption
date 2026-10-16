@@ -1,137 +1,152 @@
 """
 Rate limiting module for API call management.
 
-This module provides a thread-safe rate limiter using a sliding window
-approach to prevent exceeding API rate limits.
+This module provides a thread-safe, high-performance rate limiter
+using a sliding window with collections.deque and monotonic clocks.
 """
+from collections import deque
 import threading
 import time
 
 
 class RateLimiter:
     """
-    Thread-safe rate limiter that tracks API calls and enforces limits.
+    Thread-safe sliding-window rate limiter.
 
-    Uses a sliding window approach where calls automatically expire after
-    the specified period, rather than resetting all at once.
+    Optimizations:
+    - Uses collections.deque for O(1) removals and O(1) oldest-call lookup.
+    - Uses time.monotonic() to be immune to system clock / NTP adjustments.
+    - Uses threading.Condition instead of busy-polling with time.sleep().
+    - Supports context manager syntax (`with rate_limiter:`).
+    - Supports instant abort/wake-up for graceful batch cancellation.
     """
 
-    def __init__(self, max_calls, period):
+    def __init__(self, max_calls: int, period: float):
         """
         Initialize rate limiter.
 
         Args:
-            max_calls: Maximum number of calls allowed in the period
-            period: Time period in seconds
+            max_calls: Maximum number of calls allowed in the period.
+            period: Time period in seconds.
         """
         self.max_calls = max_calls
         self.period = period
-        self.calls = []  # Store timestamps of calls
+        self.calls = deque()
         self.lock = threading.Lock()
+        self.condition = threading.Condition(self.lock)
+        self._aborted = False
 
-    def _clean_old_calls(self):
-        """Remove calls older than the period (internal, must hold lock)."""
-        current_time = time.time()
-        cutoff_time = current_time - self.period
-        self.calls = [call_time for call_time in self.calls if call_time > cutoff_time]
+    def _clean_old_calls(self, now: float):
+        """Purge calls that have expired outside the sliding window. (Must hold lock)."""
+        cutoff = now - self.period
+        while self.calls and self.calls[0] <= cutoff:
+            self.calls.popleft()
+
+    def reserve(self, timeout: float = None) -> bool:
+        """
+        Atomically wait for an available slot and record the call.
+
+        Returns:
+            bool: True if slot was reserved, False if timed out or aborted.
+        """
+        start_time = time.monotonic()
+
+        with self.condition:
+            while True:
+                if self._aborted:
+                    return False
+
+                now = time.monotonic()
+                self._clean_old_calls(now)
+
+                if len(self.calls) < self.max_calls:
+                    self.calls.append(now)
+                    return True
+
+                # Oldest call is always at index 0 (O(1) lookup)
+                time_until_expire = self.period - (now - self.calls[0])
+                wait_time = max(0.001, time_until_expire)
+
+                if timeout is not None:
+                    elapsed = now - start_time
+                    remaining = timeout - elapsed
+                    if remaining <= 0:
+                        return False
+                    wait_time = min(wait_time, remaining)
+
+                # Suspends thread efficiently; releases lock while waiting
+                self.condition.wait(timeout=wait_time)
+
+    def wait(self, timeout: float = None) -> bool:
+        """Wait until a slot is available without consuming it."""
+        start_time = time.monotonic()
+
+        with self.condition:
+            while True:
+                if self._aborted:
+                    return False
+
+                now = time.monotonic()
+                self._clean_old_calls(now)
+
+                if len(self.calls) < self.max_calls:
+                    return True
+
+                time_until_expire = self.period - (now - self.calls[0])
+                wait_time = max(0.001, time_until_expire)
+
+                if timeout is not None:
+                    elapsed = now - start_time
+                    remaining = timeout - elapsed
+                    if remaining <= 0:
+                        return False
+                    wait_time = min(wait_time, remaining)
+
+                self.condition.wait(timeout=wait_time)
 
     def add_call(self):
-        """Record a new API call."""
-        with self.lock:
-            self.calls.append(time.time())
-            self._clean_old_calls()
+        """Record a new API call at the current time."""
+        with self.condition:
+            now = time.monotonic()
+            self._clean_old_calls(now)
+            self.calls.append(now)
 
-    def get_current_calls(self):
-        """Get the current number of calls in the period."""
-        with self.lock:
-            self._clean_old_calls()
+    def get_current_calls(self) -> int:
+        """Get the current number of active calls in the period."""
+        with self.condition:
+            self._clean_old_calls(time.monotonic())
             return len(self.calls)
 
-    def wait(self, timeout=None):
-        """
-        Wait until a call slot is available.
-
-        Args:
-            timeout: Maximum time to wait in seconds (None = wait forever)
-
-        Returns:
-            bool: True if slot became available, False if timed out
-        """
-        start_time = time.time()
-
-        while True:
-            with self.lock:
-                self._clean_old_calls()
-
-                if len(self.calls) < self.max_calls:
-                    return True
-
-                # Calculate how long until the oldest call expires
-                if self.calls:
-                    oldest_call = min(self.calls)
-                    time_until_expire = self.period - (time.time() - oldest_call)
-                    sleep_time = max(0.1, min(1.0, time_until_expire))
-                else:
-                    sleep_time = 0.1
-
-            # Check timeout
-            if timeout is not None:
-                elapsed = time.time() - start_time
-                if elapsed >= timeout:
-                    return False
-
-            time.sleep(sleep_time)
-
-    def reserve(self, timeout=None):
-        """
-        Atomically wait for a slot and record the call.
-
-        Unlike wait()+add_call(), this cannot over-subscribe under contention:
-        the slot check and the timestamp append happen inside a single
-        critical section.
-
-        Returns:
-            bool: True if a slot was reserved, False if timed out
-        """
-        start_time = time.time()
-
-        while True:
-            with self.lock:
-                self._clean_old_calls()
-
-                if len(self.calls) < self.max_calls:
-                    self.calls.append(time.time())
-                    return True
-
-                oldest_call = min(self.calls)
-                time_until_expire = self.period - (time.time() - oldest_call)
-                sleep_time = max(0.05, min(1.0, time_until_expire))
-
-            if timeout is not None:
-                elapsed = time.time() - start_time
-                if elapsed >= timeout:
-                    return False
-
-            time.sleep(sleep_time)
-
     def reset(self):
-        """Manually reset all call records (use with caution)."""
-        with self.lock:
-            self.calls = []
+        """Manually reset all call records and wake up any waiting threads."""
+        with self.condition:
+            self.calls.clear()
+            self._aborted = False
+            self.condition.notify_all()
 
-    def get_status(self):
-        """
-        Get current rate limiter status.
+    def abort(self):
+        """Immediately wake up and release any waiting threads (e.g. on Cancel)."""
+        with self.condition:
+            self._aborted = True
+            self.condition.notify_all()
 
-        Returns:
-            dict: Status information including current calls and remaining slots
-        """
-        with self.lock:
-            self._clean_old_calls()
+    def get_status(self) -> dict:
+        """Get current rate limiter status."""
+        with self.condition:
+            self._clean_old_calls(time.monotonic())
             current = len(self.calls)
             return {
                 'current_calls': current,
                 'max_calls': self.max_calls,
-                'remaining': self.max_calls - current,
+                'remaining': max(0, self.max_calls - current),
                 'period_seconds': self.period
             }
+
+    def __enter__(self):
+        """Context manager support (`with rate_limiter:`)."""
+        if not self.reserve():
+            raise TimeoutError("Could not reserve rate limit slot.")
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        pass
