@@ -1,6 +1,17 @@
+"""
+Tests for caption formatting, input sanitization, and image preparation.
+"""
+import base64
+import io
+import numpy as np
 from PIL import Image
 
 import main
+
+
+def _decode_base64_image(b64_str: str) -> Image.Image:
+    """Helper to decode base64 string back into a PIL Image for inspection."""
+    return Image.open(io.BytesIO(base64.b64decode(b64_str)))
 
 
 def test_format_caption_description_only():
@@ -56,18 +67,21 @@ def test_sanitize_text_empty():
 
 def test_scale_image_downscales_wide():
     img = Image.new("RGB", (4096, 2048), "white")
-    scaled = main.scale_image(img)
-    assert scaled.width == main.MAX_IMAGE_WIDTH
-    assert scaled.height == main.MAX_IMAGE_WIDTH // 2
+    b64 = main.prepare_image_base64(np.array(img), max_dim=main.DEFAULT_MAX_IMAGE_DIM)
+    scaled = _decode_base64_image(b64)
+    assert scaled.width == main.DEFAULT_MAX_IMAGE_DIM
+    assert scaled.height == main.DEFAULT_MAX_IMAGE_DIM // 2
 
 
 def test_scale_image_leaves_small_unchanged():
     img = Image.new("RGB", (512, 512), "white")
-    scaled = main.scale_image(img)
+    b64 = main.prepare_image_base64(np.array(img), max_dim=main.DEFAULT_MAX_IMAGE_DIM)
+    scaled = _decode_base64_image(b64)
     assert scaled.size == (512, 512)
 
 
 def test_scale_image_at_max_width_unchanged():
-    img = Image.new("RGB", (main.MAX_IMAGE_WIDTH, 800), "white")
-    scaled = main.scale_image(img)
-    assert scaled.size == (main.MAX_IMAGE_WIDTH, 800)
+    img = Image.new("RGB", (main.DEFAULT_MAX_IMAGE_DIM, 800), "white")
+    b64 = main.prepare_image_base64(np.array(img), max_dim=main.DEFAULT_MAX_IMAGE_DIM)
+    scaled = _decode_base64_image(b64)
+    assert scaled.size == (main.DEFAULT_MAX_IMAGE_DIM, 800)
