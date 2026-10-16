@@ -205,6 +205,10 @@ def generate_description_ollama(ollama_url, image, prompt, model="llava", batch_
 
         content = response.get('message', {}).get('content') if isinstance(response, dict) else response.message.content
         if not content or not str(content).strip():
+            # Extract metadata (eval_count, done_reason, etc.) to diagnose the cause
+            resp_dump = dict(response) if isinstance(response, dict) else getattr(response, '__dict__', str(response))
+            log_error(f"Ollama returned empty response. Metadata: {resp_dump}", "OLLAMA_EMPTY_RESPONSE",
+                      include_traceback=False)
             return "Error: Ollama returned an empty response."
 
         return str(content).strip()
@@ -367,6 +371,8 @@ def process_image(processing_control, provider, api_key, ollama_url, image_path,
             return False, "STOPPED", None
 
         if not description or (isinstance(description, str) and description.startswith("Error:")):
+            log_error(f"File '{os.path.basename(image_path)}' failed: {description}", "PROCESS_IMAGE_FAILED",
+                      include_traceback=False)
             return False, "ERROR", description
 
         caption = format_caption(pre_prompt, description, post_prompt)
