@@ -25,8 +25,7 @@ python main.py      # open http://127.0.0.1:7860
 ## 🧠 Suggested vision models
 | Provider | Model | Notes |
 |---|---|---|
-| Ollama | `llama3.2-vision` (11B) | Strong all-rounder. |
-| Ollama | `qwen2.5-vl` (7B) | Best for OCR / fine detail. |
+| Ollama | `qwen3-vl` (32B) | Best for OCR / fine detail. |
 | Ollama | `moondream` (1.8B) | Tiny + fast; low-VRAM option. |
 | OpenAI | `gpt-4o-mini` | Best $/quality for bulk. |
 | OpenAI | `gpt-4o` | Highest quality. |
