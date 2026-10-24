@@ -1,5 +1,7 @@
 gradio>=6.30.0
-openai>=2.54.0
-Pillow>=12.3.0
+openai>=3.37.0
+Pillow>=13.0.0
 numpy>=2.5.4
 ollama>=0.6.3
+
+pandas

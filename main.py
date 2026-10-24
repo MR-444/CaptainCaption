@@ -8,8 +8,11 @@ import base64
 from concurrent.futures import ThreadPoolExecutor
 import datetime
 import io
+import json
+import urllib.request
 import logging.handlers
 import os
+import pandas as pd
 import signal
 import sys
 import traceback
@@ -29,6 +32,7 @@ try:
 except ImportError:
     OllamaClient = None
 
+APP_TITLE = "Image Captioner"
 FOLDER_SYMBOL = '\U0001f4c2'  # 📂
 DEFAULT_MAX_IMAGE_DIM = 1024
 DEFAULT_PROMPT = "Describe this image in detail. Focus on the main subjects, actions, setting, and mood."
@@ -262,7 +266,7 @@ columns = ["Time", "Prompt", "Caption"]
 
 
 def clear_fields():
-    return "", [], []
+    return "", pd.DataFrame(columns=columns), []
 
 
 def update_history(history_list, prompt, response):
@@ -272,15 +276,9 @@ def update_history(history_list, prompt, response):
     history_list.append({"Time": timestamp, "Prompt": prompt, "Caption": response})
     return history_list, [[entry[column] for column in columns] for entry in history_list]
 
-
-def get_dir(file_path):
-    dir_path, file_name = os.path.split(file_path)
-    return dir_path, file_name
-
-
 def get_folder_path(folder_path=''):
     current_folder_path = folder_path
-    initial_dir, _ = get_dir(folder_path)
+    initial_dir = folder_path if os.path.isdir(folder_path) else os.path.dirname(folder_path)
 
     root = Tk()
     root.wm_attributes('-topmost', 1)
@@ -302,13 +300,11 @@ class ProcessingControl:
     """Thread-safe control for batch processing state management."""
 
     def __init__(self):
-        self.is_processing = False
         self.should_stop = False
         self.lock = Lock()
 
     def start(self):
         with self.lock:
-            self.is_processing = True
             self.should_stop = False
 
     def stop(self):
@@ -317,16 +313,11 @@ class ProcessingControl:
 
     def finish(self):
         with self.lock:
-            self.is_processing = False
             self.should_stop = False
 
     def is_stopped(self):
         with self.lock:
             return self.should_stop
-
-    def get_status(self):
-        with self.lock:
-            return self.is_processing, self.should_stop
 
 
 user_processing_controls = {}
@@ -439,12 +430,10 @@ def process_folder(processing_control, provider, api_key, ollama_url, folder_pat
 
         for idx, (future, filename) in enumerate(futures, start=1):
             if processing_control.is_stopped():
-                for pending, _ in futures:
-                    pending.cancel()
                 break
 
             try:
-                success, status, description = future.result()
+                _, status, description = future.result()
 
                 if status == "SUCCESS":
                     processed_count += 1
@@ -455,15 +444,11 @@ def process_folder(processing_control, provider, api_key, ollama_url, folder_pat
                 elif status == "CRITICAL":
                     critical_error_msg = description
                     print(f"✗ CRITICAL ERROR: {description}")
-                    for pending, _ in futures:
-                        pending.cancel()
                     break
                 elif status == "ERROR":
                     error_count += 1
                     print(f"✗ Error: {filename} - {description}")
                 elif status == "STOPPED":
-                    for pending, _ in futures:
-                        pending.cancel()
                     break
 
                 try:
@@ -521,9 +506,6 @@ _VISION_NAME_HINTS = (
 
 
 def list_ollama_models(url, timeout=3.0):
-    import json
-    import urllib.request
-
     base = (url or "http://localhost:11434").rstrip("/")
     try:
         with urllib.request.urlopen(f"{base}/api/tags", timeout=timeout) as resp:
@@ -540,9 +522,6 @@ def list_ollama_models(url, timeout=3.0):
 
 
 def list_running_ollama_models(url, timeout=3.0):
-    import json
-    import urllib.request
-
     base = (url or "http://localhost:11434").rstrip("/")
     try:
         with urllib.request.urlopen(f"{base}/api/ps", timeout=timeout) as resp:
@@ -559,9 +538,6 @@ def list_running_ollama_models(url, timeout=3.0):
 
 
 def get_ollama_model_capabilities(url, model_name, timeout=3.0):
-    import json
-    import urllib.request
-
     base = (url or "http://localhost:11434").rstrip("/")
     req = urllib.request.Request(
         f"{base}/api/show",
@@ -621,9 +597,13 @@ def format_caption(pre_prompt, description, post_prompt):
 
 
 # Gradio UI
-with gr.Blocks(title="Image Captioner") as app:
-    gr.Markdown("# 🖼️ Image Captioner")
-    gr.Markdown("Generate captions for single images or batch-process entire folders using OpenAI or local Ollama models.")
+with gr.Blocks(title=APP_TITLE) as app:
+    gr.Markdown(
+        f"""
+        # 🖼️ {APP_TITLE}
+        Generate captions for single images or batch-process entire folders using OpenAI or local Ollama models.
+        """
+    )
 
     history_state = gr.State(lambda: [])
 
@@ -810,7 +790,7 @@ with gr.Blocks(title="Image Captioner") as app:
                 interactive=True,
                 info="Folder containing images to caption"
             )
-            folder_button = gr.Button('📂', scale=1, size="sm")
+            folder_button = gr.Button(FOLDER_SYMBOL, scale=1, size="sm")
 
         with gr.Row():
             prompt_input_dataset = gr.Textbox(
@@ -951,7 +931,7 @@ with gr.Blocks(title="Image Captioner") as app:
     )
 
     clear_button.click(clear_fields, inputs=[], outputs=[output, history_table, history_state])
-    folder_button.click(get_folder_path, outputs=folder_path_dataset, show_progress="hidden")
+    folder_button.click(get_folder_path, outputs=folder_path_dataset, show_progress="hidden", inputs=[folder_path_dataset])
 
     submit_button.click(
         on_single_image_submit,
