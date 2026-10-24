@@ -13,6 +13,7 @@ import urllib.request
 import logging.handlers
 import os
 import pandas as pd
+import re
 import signal
 import sys
 import traceback
@@ -197,25 +198,37 @@ def generate_description_ollama(ollama_url, image, prompt, model="llava", batch_
         img_base64 = prepare_image_base64(image, max_dim=max_image_dim)
 
         client = OllamaClient(host=ollama_url, timeout=timeout) if ollama_url else OllamaClient(timeout=timeout)
-        response = client.chat(
-            model=model,
-            messages=[{
+
+        chat_kwargs = {
+            'model': model,
+            'messages': [{
                 'role': 'user',
                 'content': prompt,
                 'images': [img_base64]
             }],
-            options={'num_ctx': int(num_ctx)}
-        )
+            'options': {'num_ctx': int(num_ctx)},
+            'think': False,  # Disables thinking/reasoning mode for speed
+        }
+        try:
+            response = client.chat(**chat_kwargs)
+        except TypeError:
+            # Fallback if installed ollama-python package does not yet support the 'think' argument
+            chat_kwargs.pop('think', None)
+            response = client.chat(**chat_kwargs)
 
         content = response.get('message', {}).get('content') if isinstance(response, dict) else response.message.content
         if not content or not str(content).strip():
-            # Extract metadata (eval_count, done_reason, etc.) to diagnose the cause
             resp_dump = dict(response) if isinstance(response, dict) else getattr(response, '__dict__', str(response))
             log_error(f"Ollama returned empty response. Metadata: {resp_dump}", "OLLAMA_EMPTY_RESPONSE",
                       include_traceback=False)
             return "Error: Ollama returned an empty response."
 
-        return str(content).strip()
+        # Safety cleanup: strip any residual <think>...</think> blocks from output
+        cleaned_content = re.sub(r'<think>.*?</think>', '', str(content), flags=re.DOTALL).strip()
+        if not cleaned_content:
+            return str(content).strip()
+
+        return cleaned_content
 
     except ConnectionError as e:
         log_error(e, "OLLAMA_CONNECTION", include_traceback=False)
