@@ -409,11 +409,11 @@ def process_folder(processing_control, provider, api_key, ollama_url, folder_pat
     processing_control.start()
 
     image_extensions = {'.png', '.jpg', '.jpeg', '.webp', '.bmp', '.tiff', '.tif'}
-    file_list = [
+    file_list = sorted([
         os.path.join(folder_path, f)
         for f in os.listdir(folder_path)
         if os.path.splitext(f)[1].lower() in image_extensions
-    ]
+    ])
 
     if not file_list:
         processing_control.finish()
